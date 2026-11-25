@@ -115,3 +115,54 @@ curl http://localhost/ask -X POST -H "Content-Type: application/json" -d '{"ques
 ```
 
 Cả hai request đi qua Nginx (cổng 80) tới agent và đều trả về kết quả hợp lệ.
+
+---
+
+## Part 4: API Security
+
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
+
+- **API key được check ở đâu?** Trong hàm dependency `verify_api_key` (đọc header `X-API-Key` bằng `APIKeyHeader`), được inject vào endpoint `/ask` qua `Depends(verify_api_key)`. Key đúng được đọc từ biến môi trường `AGENT_API_KEY`.
+- **Điều gì xảy ra nếu sai key?** Thiếu key → `401 Unauthorized`; có key nhưng sai → `403 Forbidden`; đúng key → `200 OK`.
+- **Làm sao rotate key?** Đặt giá trị mới cho biến môi trường `AGENT_API_KEY` (không sửa code, không commit key) rồi restart/redeploy service; key cũ lập tức hết hiệu lực. Client phải cập nhật sang key mới.
+
+Test thực tế (server chạy với `AGENT_API_KEY=secret-key-123`):
+
+```
+curl -i .../ask -X POST -d '{"question": "Hello"}'                         → HTTP/1.1 401 Unauthorized  {"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+curl -i .../ask -X POST -H "X-API-Key: wrong-key" ...                      → HTTP/1.1 403 Forbidden     {"detail":"Invalid API key."}
+curl -i .../ask -X POST -H "X-API-Key: secret-key-123" ...                 → HTTP/1.1 200 OK            {"question":"Hello","answer":"..."}
+```
+
+### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
+
+Luồng JWT: client gửi `POST /auth/token` với username/password → server xác thực (`authenticate_user`) và ký token HS256 bằng `JWT_SECRET`, token chứa `sub` (username), `role` và `exp` (hết hạn sau 60 phút) → client gửi token qua header `Authorization: Bearer <token>` → dependency `verify_token` giải mã và kiểm tra chữ ký/hạn dùng cho mỗi request, không cần tra DB.
+
+Test thực tế (user `student` / `demo123`, token đã được ẩn bớt):
+
+```
+POST /auth/token                       → token bắt đầu bằng eyJhbGciOiJIUzI1NiIs...
+POST /ask  (Authorization: Bearer ...) → 200 OK, "usage":{"requests_remaining":9,"budget_remaining_usd":1.6e-05}
+POST /ask  (không có token)            → 401 Unauthorized  {"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+```
+
+Response còn có các security header: `x-content-type-options: nosniff`, `x-frame-options: DENY`, `x-xss-protection`, `referrer-policy`.
+
+### Exercise 4.3: Rate limiting (`rate_limiter.py`)
+
+- **Algorithm:** Sliding window counter — mỗi user có một `deque` các timestamp; timestamp cũ hơn cửa sổ 60 giây bị loại bỏ trước mỗi lần check.
+- **Limit:** user thường 10 requests/phút (`rate_limiter_user`), admin 100 requests/phút (`rate_limiter_admin`).
+- **Bypass cho admin:** không bypass hoàn toàn; endpoint chọn limiter theo `role` trong token — role `admin` (ví dụ user `teacher`) dùng limiter 100 req/phút.
+
+Test thực tế (gọi liên tục 12 lần với token của `student`; đã có 1 request trước đó trong cùng cửa sổ):
+
+```
+1..9 -> 200
+10, 11, 12 -> 429
+```
+
+Response khi bị chặn: `HTTP/1.1 429 Too Many Requests`, header `x-ratelimit-limit: 10`, `x-ratelimit-remaining: 0`, `retry-after: 44`, body `{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":44}}`.
+
+### Exercise 4.4: Cost guard (`cost_guard.py`)
+
+Bản trong `04-api-gateway/production/cost_guard.py` theo dõi usage theo user theo ngày: tính chi phí từ số token (input $0.00015/1K, output $0.0006/1K), kiểm tra trước khi gọi LLM, và trả `402 Payment Required` khi user vượt budget ngày ($1/ngày/user), `503` khi vượt budget toàn cục ($10/ngày); cảnh báo log khi dùng 80% budget. Bản này lưu in-memory nên mất khi restart và không chia sẻ giữa nhiều instance; trong production dùng Redis (key dạng `budget:{user_id}:{YYYY-MM}`, cộng dồn bằng `INCRBYFLOAT`, đặt `EXPIRE`) để trạng thái nhất quán khi scale. Phần này sẽ được làm thật trong `06-lab-complete/app/cost_guard.py` (Part 6).

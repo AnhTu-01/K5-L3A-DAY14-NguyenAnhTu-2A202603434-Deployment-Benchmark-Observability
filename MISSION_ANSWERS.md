@@ -166,3 +166,50 @@ Response khi bị chặn: `HTTP/1.1 429 Too Many Requests`, header `x-ratelimit-
 ### Exercise 4.4: Cost guard (`cost_guard.py`)
 
 Bản trong `04-api-gateway/production/cost_guard.py` theo dõi usage theo user theo ngày: tính chi phí từ số token (input $0.00015/1K, output $0.0006/1K), kiểm tra trước khi gọi LLM, và trả `402 Payment Required` khi user vượt budget ngày ($1/ngày/user), `503` khi vượt budget toàn cục ($10/ngày); cảnh báo log khi dùng 80% budget. Bản này lưu in-memory nên mất khi restart và không chia sẻ giữa nhiều instance; trong production dùng Redis (key dạng `budget:{user_id}:{YYYY-MM}`, cộng dồn bằng `INCRBYFLOAT`, đặt `EXPIRE`) để trạng thái nhất quán khi scale. Phần này sẽ được làm thật trong `06-lab-complete/app/cost_guard.py` (Part 6).
+
+---
+
+## Part 5: Scaling & Reliability
+
+Stack được chạy từ `05-scaling-reliability/production/` bằng:
+
+```bash
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+```
+
+### Exercise 5.1: Health checks
+
+- `GET /health` (liveness): trả 200 khi process còn sống, để platform biết khi nào cần restart container.
+- `GET /ready` (readiness): kiểm tra phụ thuộc (Redis); trả 200 khi sẵn sàng nhận traffic và **503** khi Redis không khả dụng, để load balancer không gửi request tới instance chưa sẵn sàng.
+- Trong compose, mỗi agent có `healthcheck` gọi `/health`; kết quả thực tế `docker compose ps`: cả 3 agent ở trạng thái `Up ... (healthy)`.
+
+### Exercise 5.2: Graceful shutdown
+
+Khi orchestrator gửi SIGTERM, ứng dụng phải ngừng nhận request mới, để các request đang xử lý hoàn tất, đóng kết nối (Redis...) rồi mới thoát. Trong app dùng `lifespan` của FastAPI: phần sau `yield` chạy khi shutdown (log "Instance ... shutting down"), và uvicorn xử lý SIGTERM theo hướng này. Ý nghĩa: deploy/scale-down không làm rớt request đang chạy.
+
+### Exercise 5.3: Stateless design
+
+Anti-pattern là lưu hội thoại trong biến memory của tiến trình (`conversation_history = {}`): khi scale ra nhiều instance, mỗi instance có memory riêng nên request tiếp theo rơi vào instance khác sẽ mất lịch sử. Bản production lưu session trong Redis (`session:{session_id}` qua `save_session`/`load_session`, có TTL), nên mọi instance đều đọc được cùng một session.
+
+### Exercise 5.4: Load balancing
+
+Chạy 3 agent + Redis + Nginx (cổng 8080). Nginx dùng upstream `agent:8000` (DNS round-robin tới 3 container) và `proxy_next_upstream error timeout http_503` để chuyển sang instance khác khi một instance lỗi.
+
+`docker compose -p k5-day14-scaling ps`: `agent-1`, `agent-2`, `agent-3` đều `healthy`; `nginx` publish `8080->80`; `redis` `healthy`.
+
+`python test_stateless.py` (5 request cùng một session):
+
+```
+Request 1: [instance-e3e76b]
+Request 2: [instance-a62a4b]
+Request 3: [instance-8e4a57]
+Request 4: [instance-e3e76b]
+Request 5: [instance-a62a4b]
+Instances used: {'instance-8e4a57', 'instance-a62a4b', 'instance-e3e76b'}
+✅ All requests served despite different instances!
+Conversation History: Total messages: 10  → ✅ Session history preserved across all instances via Redis!
+```
+
+10 request liên tiếp tới `/chat` được phân tán luân phiên: `e3e76b, a62a4b, 8e4a57, e3e76b, a62a4b, 8e4a57, e3e76b, a62a4b, 8e4a57, e3e76b`.
+
+**Kill một instance:** chạy `docker stop k5-day14-scaling-agent-1`, rồi gửi 6 request tới `http://localhost:8080/chat` → cả 6 đều trả **200**. Traffic tự chuyển sang 2 instance còn lại và hệ thống không gián đoạn.

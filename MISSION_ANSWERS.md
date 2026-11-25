@@ -267,3 +267,43 @@ Tôi dùng Claude (Anthropic) trong suốt bài lab. Ghi lại từng lần dùn
 | Part 4 | Hướng dẫn test API key, JWT, rate limit, bản nháp mục 4.1–4.4 | Lệnh test và nội dung mục Part 4 | Tự chạy: 401/403/200 với API key, JWT 200/401, rate limit 429 ở request thứ 10 |
 | Part 5 | Hướng dẫn chạy stack scale 3 instance, bản nháp mục Part 5 | Lệnh `docker compose -p k5-day14-scaling ...` và nội dung mục Part 5 | Tự chạy: 3 agent `healthy`, `test_stateless.py`, `served_by` luân phiên, dừng `agent-1` vẫn 200 |
 | Part 6 | Điền các TODO trong `06-lab-complete/` để đạt PASS 12/12 | Code cho `config.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`, `redis_client.py`, `main.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml` | Đọc lại code, tự chạy `python check_production_ready.py` (`--static-only` rồi đầy đủ) trên máy có Docker → PASS 12/12; không sửa `check_production_ready.py` |
+
+---
+
+## Part 3: Cloud Deployment
+
+### Exercise 3.1: Deploy Railway (agent của Part 6)
+
+- **Nền tảng:** Railway
+- **Public URL:** https://agent-production-23006998.up.railway.app
+- Các bước: `npm i -g @railway/cli` → `railway login` → `railway init` (project `k5-day14-agent`) → `railway add --database redis` → `railway add --service agent` → đặt biến môi trường bằng `railway variables --service agent --set ...` (`AGENT_API_KEY` sinh ngẫu nhiên bằng `openssl rand -hex 24`, `REDIS_URL=${{Redis.REDIS_URL}}`, `ENVIRONMENT`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`) → `railway up --service agent` → `railway domain --service agent`.
+- Railway build image từ `Dockerfile` của `06-lab-complete/` (theo `railway.toml`), cấp biến `PORT` (app lắng nghe cổng 8080), và dùng service Redis riêng trong cùng project.
+- Cách xem log: `railway logs --service agent` hoặc tab Logs của service trên dashboard (log của app là JSON).
+
+Kết quả test 4 lệnh trên URL public:
+
+```
+GET  /health                              → 200 {"status":"ok","environment":"production"}
+GET  /ready                               → 200 {"ready":true}
+POST /ask (không có API key)              → 401 {"detail":"Invalid or missing API key. Include header: X-API-Key: <key>"}
+POST /ask (X-API-Key đúng, "What is deployment?") → 200 {"question":"What is deployment?","answer":"Deployment là quá trình đưa code từ máy bạn lên server để người khác dùng được."}
+```
+
+### Exercise 3.2: So sánh `railway.toml` và `render.yaml`
+
+| | `railway.toml` (Railway) | `render.yaml` (Render Blueprint) |
+|---|---|---|
+| Phạm vi | Cấu hình **một service**: cách build và deploy | Mô tả **cả hạ tầng**: nhiều service (web, Redis...), region, plan |
+| Build | `[build] builder = "NIXPACKS"` hoặc `"DOCKERFILE"` | `runtime: python` + `buildCommand`, hoặc `runtime: docker` |
+| Lệnh chạy | `startCommand` (dùng `$PORT` do Railway cấp) | `startCommand` (dùng `$PORT` do Render cấp) |
+| Health check | `healthcheckPath`, `healthcheckTimeout` | `healthCheckPath` |
+| Restart | `restartPolicyType`, `restartPolicyMaxRetries` | Render tự restart; không khai báo ở đây |
+| Biến môi trường / secret | Không khai báo trong file — đặt bằng `railway variables` hoặc dashboard | Khai báo `envVars` ngay trong file; secret dùng `sync: false` (nhập tay trên dashboard) hoặc `generateValue: true` (Render tự sinh) |
+| Redis / dịch vụ phụ | Thêm riêng trong project (`railway add --database redis`) | Khai báo cùng file (`type: redis`) |
+| Auto deploy | Dùng `railway up` hoặc kết nối GitHub trên dashboard | `autoDeploy: true` khi push GitHub |
+
+Khác biệt chính: `railway.toml` chỉ là "config as code" cho cách build/deploy một service, còn hạ tầng và secret được quản lý qua CLI/dashboard; `render.yaml` là Infrastructure as Code đầy đủ, commit vào git là Render tự đồng bộ cả hạ tầng, nên tái tạo môi trường dễ hơn. Tôi chọn Railway vì CLI đơn giản, deploy trực tiếp từ thư mục và có sẵn Redis plugin.
+
+### Exercise 3.3: Cloud Run (chỉ đọc, không deploy)
+
+Pipeline CI/CD trong `cloudbuild.yaml` (chạy mỗi khi push lên `main`) gồm 4 bước tuần tự: (1) **test** — cài requirements và chạy `pytest` trong container `python:3.11-slim`, lỗi thì dừng; (2) **build** — build Docker image, gắn tag `$COMMIT_SHA` và `latest`, dùng `--cache-from` để tận dụng layer cache; (3) **push** — đẩy image lên Container Registry; (4) **deploy** — `gcloud run deploy` lên Cloud Run vùng `asia-southeast1`, public, `min-instances=1` (tránh cold start), `max-instances=10`, 512Mi RAM, secret lấy từ Secret Manager (`--set-secrets`). `service.yaml` là định nghĩa dịch vụ dạng IaC (Knative): autoscaling min 1 / max 10, `containerConcurrency: 80`, `timeoutSeconds: 60`, biến môi trường và secret từ Secret Manager, `livenessProbe` gọi `/health` và `startupProbe` gọi `/ready`.

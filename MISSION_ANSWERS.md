@@ -213,3 +213,57 @@ Conversation History: Total messages: 10  → ✅ Session history preserved acro
 10 request liên tiếp tới `/chat` được phân tán luân phiên: `e3e76b, a62a4b, 8e4a57, e3e76b, a62a4b, 8e4a57, e3e76b, a62a4b, 8e4a57, e3e76b`.
 
 **Kill một instance:** chạy `docker stop k5-day14-scaling-agent-1`, rồi gửi 6 request tới `http://localhost:8080/chat` → cả 6 đều trả **200**. Traffic tự chuyển sang 2 instance còn lại và hệ thống không gián đoạn.
+
+---
+
+## Part 6: Final Project (`06-lab-complete/`)
+
+Đã hoàn thành các TODO trong `app/config.py`, `app/auth.py`, `app/rate_limiter.py`, `app/cost_guard.py`, `app/redis_client.py`, `app/main.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`.
+
+Các quyết định thiết kế chính:
+
+- **Config:** `Settings` đọc `PORT`, `ENVIRONMENT`, `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD` từ biến môi trường; không hard-code secret (`AGENT_API_KEY` mặc định rỗng).
+- **Auth:** header `X-API-Key`, so sánh bằng `secrets.compare_digest`; thiếu hoặc sai → 401.
+- **Rate limit:** sliding window 60 giây bằng Redis sorted set (key băm từ API key), vượt → 429 + `Retry-After`; state trong Redis nên còn nguyên sau khi restart agent.
+- **Cost guard:** cộng dồn chi phí theo token vào Redis theo ngày và theo tháng; vượt `DAILY_BUDGET_USD` hoặc `MONTHLY_BUDGET_USD` → 402.
+- **/health vs /ready:** `/health` luôn 200; `/ready` trả 503 khi Redis không kết nối được. Client Redis tạo lazy nên app vẫn khởi động được khi chưa có Redis.
+- **Logging:** `JsonFormatter` tự viết, mỗi dòng log của app là một JSON object.
+- **Graceful shutdown:** dùng `lifespan` của FastAPI; uvicorn xử lý SIGTERM (chờ request đang chạy xong, thoát exit code 0). `CMD` dùng `exec uvicorn` để uvicorn là PID 1.
+- **Docker:** multi-stage (builder tạo virtualenv, runtime `python:3.11-slim`), user non-root, `HEALTHCHECK`, `CMD` theo biến `PORT`.
+
+Kết quả chạy `python check_production_ready.py` (chế độ đầy đủ, trên máy của tôi, có Docker):
+
+```
+📋 Checklist Deliverable
+   ✅ Dockerfile (multi-stage, < 500 MB)
+   ✅ docker-compose.yml (agent + redis)
+   ✅ .dockerignore
+   ✅ Health check endpoint (GET /health)
+   ✅ Readiness endpoint (GET /ready)
+   ✅ API Key authentication
+   ✅ Rate limiting
+   ✅ Cost guard
+   ✅ Config từ environment variables
+   ✅ Structured logging
+   ✅ Graceful shutdown
+   ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 41/41 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+```
+
+Chi tiết: build image 26 s, kích thước 183 MB (< 500 MB), `docker stop` thoát exit code 0 trong 0.5 s, rate limit trả 429 sau 5 request (với `RATE_LIMIT_PER_MINUTE=5`), cost guard trả 402 ở request thứ 1 (với budget ≈ 0).
+
+---
+
+## AI log
+
+Tôi dùng Claude (Anthropic) trong suốt bài lab. Ghi lại từng lần dùng:
+
+| Phần | Tôi hỏi gì | Nhận được gì | Tôi tự kiểm chứng / chỉnh sửa thế nào |
+|---|---|---|---|
+| Setup & Part 1 | Hướng dẫn clone repo, thiết lập môi trường, chạy bản develop/production | Từng lệnh Terminal và bản nháp câu trả lời Exercise 1.1–1.3 | Tự chạy các lệnh, quan sát log (key lộ trong log của bản develop), kết quả `/ask`, `/health`, `/ready` đều 200; đối chiếu số dòng anti-pattern với `app.py` |
+| Part 2 | Hướng dẫn build Docker, bản nháp câu trả lời 2.1–2.4 | Lệnh build/run và nội dung các mục 2.1–2.4 | Tự build 2 image, số đo thật 1.15 GB và 163 MB; tự chạy compose, `docker compose ps` và `curl` qua Nginx |
+| Part 4 | Hướng dẫn test API key, JWT, rate limit, bản nháp mục 4.1–4.4 | Lệnh test và nội dung mục Part 4 | Tự chạy: 401/403/200 với API key, JWT 200/401, rate limit 429 ở request thứ 10 |
+| Part 5 | Hướng dẫn chạy stack scale 3 instance, bản nháp mục Part 5 | Lệnh `docker compose -p k5-day14-scaling ...` và nội dung mục Part 5 | Tự chạy: 3 agent `healthy`, `test_stateless.py`, `served_by` luân phiên, dừng `agent-1` vẫn 200 |
+| Part 6 | Điền các TODO trong `06-lab-complete/` để đạt PASS 12/12 | Code cho `config.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`, `redis_client.py`, `main.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml` | Đọc lại code, tự chạy `python check_production_ready.py` (`--static-only` rồi đầy đủ) trên máy có Docker → PASS 12/12; không sửa `check_production_ready.py` |
